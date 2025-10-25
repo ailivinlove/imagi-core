@@ -886,6 +886,36 @@
             }
         };
 
+        // INSERT: Premise sanitizer and generator guards
+        function sanitizePremiseText(txt) {
+            return txt
+                .replace(/\babout\b/gi, '')
+                .replace(/\bexactly\b/gi, '')
+                .replace(/\bopposite\b/gi, 'inverted')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        function wordCountOk(txt) {
+            if (!txt) return false;
+            return txt.split(/\s+/).filter(Boolean).length <= 7;
+        }
+
+        export function enforceTrialBudgetAndNovelty(windowPremises, candidatePremise) {
+            if (!candidatePremise || !candidatePremise.atoms || candidatePremise.atoms.length !== 1) return null;
+
+            const windowKeys = new Set(windowPremises.flatMap(P => P.atomKeys()));
+            const windowTexts = new Set(windowPremises.map(P => sanitizePremiseText(P.toString()).toLowerCase()));
+            const aKey = candidatePremise.atoms[0].toKey();
+            if (windowKeys.has(aKey)) return null;
+
+            const text = sanitizePremiseText(candidatePremise.toString());
+            if (!wordCountOk(text)) return null;
+            if (windowTexts.has(text.toLowerCase())) return null;
+
+            return new Premise([candidatePremise.atoms[0]]);
+        }
+
         const NUM_TRIALS_KEY = 'numTrials';
         const LISTEN_ONLY_KEY = 'listenOnly';
         const numTrialsInput = document.getElementById('numTrialsInput');
@@ -2073,6 +2103,96 @@
             }
         }
 
+        // INSERT: Derived-only entailment utilities (keeps UI unchanged)
+        const AXIS_STEP = { N: [0, +1], S: [0, -1], E: [+1, 0], W: [-1, 0] };
+
+        function composeAxis(a1, a2) {
+            const u = AXIS_STEP[a1], v = AXIS_STEP[a2];
+            if (!u || !v) return null;
+            const dx = u[0] + v[0], dy = u[1] + v[1];
+            if (dx === 0 && dy === +1) return 'N';
+            if (dx === 0 && dy === -1) return 'S';
+            if (dx === +1 && dy === 0) return 'E';
+            if (dx === -1 && dy === 0) return 'W';
+            return null;
+        }
+
+        function buildAxisGraph(windowPremises) {
+            const adj = new Map();
+            const addEdge = (u, v, axis) => {
+                if (!adj.has(u)) adj.set(u, new Map());
+                if (!adj.get(u).has(v)) adj.get(u).set(v, new Set());
+                adj.get(u).get(v).add(axis);
+            };
+            for (const P of windowPremises) {
+                for (const a of P.atoms) {
+                    addEdge(a.tail, a.head, a.axis);
+                    const inv = Atom.invert(a);
+                    addEdge(inv.tail, inv.head, inv.axis);
+                }
+            }
+            return adj;
+        }
+
+        function deriveEntailedAtoms(windowPremises) {
+            const adj = buildAxisGraph(windowPremises);
+            const letters = new Set();
+            for (const P of windowPremises) {
+                P.atoms.forEach(a => { letters.add(a.head); letters.add(a.tail); });
+            }
+            const L = [...letters];
+            const entailed = new Set();
+            for (const src of L) {
+                const frontier = [];
+                const seen = new Set();
+                const startMap = adj.get(src) || new Map();
+                for (const [mid, axes] of startMap.entries()) {
+                    for (const ax of axes) {
+                        frontier.push([mid, ax]);
+                        seen.add(`${mid}|${ax}`);
+                        entailed.add(`${ax},${mid},${src}`);
+                    }
+                }
+                while (frontier.length) {
+                    const [node, acc] = frontier.shift();
+                    const nextMap = adj.get(node);
+                    if (!nextMap) continue;
+                    for (const [nbr, axes] of nextMap.entries()) {
+                        for (const ax of axes) {
+                            const comp = composeAxis(acc, ax);
+                            if (!comp) continue;
+                            const key = `${nbr}|${comp}`;
+                            if (seen.has(key)) continue;
+                            seen.add(key);
+                            frontier.push([nbr, comp]);
+                            entailed.add(`${comp},${nbr},${src}`);
+                        }
+                    }
+                }
+            }
+            const out = [];
+            for (const k of entailed) {
+                const [axis, head, tail] = k.split(',');
+                out.push(new Atom(axis, head, tail));
+            }
+            return out;
+        }
+
+        export function validateDerivedOnlyMatch(trials, t, k) {
+            if (t <= k) return false;
+            const windowPremises = [];
+            for (let i = t - k; i < t; i++) windowPremises.push(trials[i]);
+            const entailed = deriveEntailedAtoms(windowPremises);
+            const entailedKeys = new Set(entailed.map(a => a.toKey()));
+            const windowAtomKeys = new Set(windowPremises.flatMap(P => P.atomKeys()));
+            const target = trials[t].atoms;
+            if (!target || target.length !== 1) return false;
+
+            const key = target[0].toKey();
+            if (windowAtomKeys.has(key)) return false;
+            return entailedKeys.has(key);
+        }
+
         class NoveltyManager {
             constructor(windowSize = HAMMING_WINDOW, firstN = FIRST_N_NOVELTY) {
                 this.windowSize = windowSize;
@@ -2902,6 +3022,12 @@
                 } = options;
 
                 const windowAtoms = this.state.getWindowAtoms();
+                const windowPremisesForGuard = [];
+                const windowStart = Math.max(0, this.state.currentStep - k);
+                for (let idx = windowStart; idx < this.state.currentStep; idx++) {
+                    const prev = this.state.getPremiseAt(idx);
+                    if (prev) windowPremisesForGuard.push(prev);
+                }
                 let bestCandidate = null;
                 let attempts = 0;
                 let expanded = false;
@@ -2970,6 +3096,13 @@
                         attempts++;
                         candidateAtoms = candidatePremise.atoms;
                     }
+
+                    const guardedPremise = enforceTrialBudgetAndNovelty(windowPremisesForGuard, candidatePremise);
+                    if (!guardedPremise) {
+                        continue;
+                    }
+                    candidatePremise = guardedPremise;
+                    candidateAtoms = candidatePremise.atoms;
 
                     const premise = candidatePremise;
                     const features = premise.getFeatures();
@@ -3829,6 +3962,10 @@
                 return this.speak(text, guardToken);
             }
         }
+        export function isMatchDerivedOnly(trials, t, k) {
+            return validateDerivedOnlyMatch(trials, t, k);
+        }
+
         class GameEngine {
             constructor() {
                 this.session = sessionDefaults();
@@ -4255,12 +4392,39 @@
 
             buildNeutralNonMatch(plan) {
                 const letters = this.state?.letters || 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-                const head = this.state?.rng ? this.state.rng.choice(letters) : letters[0];
-                const tails = letters.filter(letter => letter !== head);
-                const tail = (this.state?.rng ? this.state.rng.choice(tails.length ? tails : letters) : (tails[0] || letters[1] || head));
-                const axis = this.state?.rng ? this.state.rng.choice(MATCH_AXES) : 'N';
-                const safeTail = tail === head ? letters[(letters.indexOf(head) + 1) % letters.length] : tail;
-                const premise = new Premise([new Atom(axis, head, safeTail)]);
+                const windowPremises = this.currentPremises.slice(Math.max(0, this.currentPremises.length - this.k));
+                let premise = null;
+                const limit = 80;
+                for (let guard = 0; guard < limit && !premise; guard++) {
+                    const head = this.state?.rng ? this.state.rng.choice(letters) : letters[guard % letters.length];
+                    const tailOptions = letters.filter(letter => letter !== head);
+                    let tail = tailOptions.length
+                        ? (this.state?.rng ? this.state.rng.choice(tailOptions) : tailOptions[0])
+                        : null;
+                    if (!tail || tail === head) {
+                        const idx = (letters.indexOf(head) + 1) % letters.length;
+                        tail = letters[idx] || letters[0];
+                    }
+                    if (tail === head) {
+                        continue;
+                    }
+                    const axis = this.state?.rng ? this.state.rng.choice(MATCH_AXES) : 'N';
+                    const candidate = new Premise([new Atom(axis, head, tail)]);
+                    const guarded = enforceTrialBudgetAndNovelty(windowPremises, candidate);
+                    if (guarded) {
+                        premise = guarded;
+                    }
+                }
+
+                if (!premise) {
+                    const fallbackHead = letters[0];
+                    const fallbackTailCandidate = letters.find(letter => letter !== fallbackHead) || letters[0];
+                    const fallbackTail = fallbackTailCandidate === fallbackHead
+                        ? letters[(letters.indexOf(fallbackHead) + 1) % letters.length] || fallbackHead
+                        : fallbackTailCandidate;
+                    const fallbackCandidate = new Premise([new Atom('N', fallbackHead, fallbackTail)]);
+                    premise = enforceTrialBudgetAndNovelty(windowPremises, fallbackCandidate) || fallbackCandidate;
+                }
                 const signatures = this.state ? this.state.novelty.buildSignatures(premise) : { exact: premise.toKey() };
                 const windowAtoms = this.state ? this.state.getWindowAtoms() : [];
                 const satResult = this.solver ? this.solver.evaluate(windowAtoms, premise.atoms) : { ok: true, coordinates: new Map() };
@@ -4365,7 +4529,7 @@
                 const responseChoice = response?.type === 'answer' ? response.choice : null;
                 const timeout = response?.type === 'timeout';
                 const omission = timeout || responseChoice === null;
-                const actualMatch = Boolean(planMatch && certificate);
+                const actualMatch = isMatchDerivedOnly(this.currentPremises, currentIndex, this.k);
                 let correct = null;
                 if (!timeout && responseChoice !== null) {
                     correct = (responseChoice === 'match') === actualMatch;
@@ -4403,7 +4567,7 @@
                     }
                 }
 
-                if (actualMatch && certificate) {
+                if (actualMatch) {
                     this.state.applyCooldown(Array.from(premise.getLetters()), currentIndex, this.n);
                 }
 
